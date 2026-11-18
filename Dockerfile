@@ -5,4 +5,4 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 EXPOSE 8000 8443
-CMD ["python","app.py"]
+CMD ["python", "app.py"]

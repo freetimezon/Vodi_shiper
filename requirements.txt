@@ -1,12 +1,11 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-httpx==0.25.1
-websockets==12.0
+fastapi==0.163.2
+# Keep the HTTP stack on versions with the published security fixes.
+starlette>=1.10.0,<2
+anyio>=4.16.0,<5
+uvicorn[standard]==0.54.0
+httpx[http2]==0.28.1
 aiofiles>=23.2.1
-httpx[http2]
 cryptography>=41.0.0
-
 psutil>=5.9.8
 python-socks[asyncio]>=2.4.3
-
-pg8000>=1.30.5
+pg8000==1.31.6

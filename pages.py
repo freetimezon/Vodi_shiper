@@ -4518,7 +4518,7 @@ async function loadAdmins(){
     const activeAdmins = adminRows.filter(a=>a.active).length;
     if($('adminTotal')) $('adminTotal').textContent = adminRows.length;
     if($('adminActive')) $('adminActive').textContent = activeAdmins;
-    const _n=adminRows.filter(x=>x.role!=='owner'&&(x.allowed_inbounds||[]).length).length;
+    const _n=adminRows.filter(x=>x.role!=='owner'&&x.scoped).length;
     if($('adScoped')){$('adScoped').textContent=_n;$('adFull').textContent=adminRows.length-_n;$('adInb').textContent=(LINKS||[]).filter(x=>!x.is_client).length;}
     $('adminsBody').innerHTML = adminRows.map(a=>{
       const isOwner = a.role==='owner';
@@ -4535,7 +4535,7 @@ async function loadAdmins(){
         <button class="iconbtn danger" title="حذف ادمین" aria-label="حذف ادمین" onclick="deleteAdmin('${a.id}')"><i class="ti ti-trash" style="color:var(--bad)"></i></button>`;
       const ibAll=(LINKS||[]).filter(x=>!x.is_client);
       const scope=isOwner?[]:(a.allowed_inbounds||[]);
-      const full=isOwner||!scope.length;
+      const full=isOwner||!a.scoped;
       const picked=scope.map(u=>ibAll.find(x=>x.uuid===u)).filter(Boolean);
       const pct=full?100:Math.round(picked.length/Math.max(1,ibAll.length)*100);
       const ibChips=full
@@ -4585,7 +4585,8 @@ function editAdmin(id){
   openDrawer('ویرایش ادمین', `
     <div class="grp"><label>نام کاربری</label><input id="eUser" value="${escapeHtml(a.username||'')}"></div>
     <div class="grp"><label>رمز جدید <small>(اختیاری)</small></label><input type="password" id="ePass" placeholder="بدون تغییر خالی بگذار"></div>
-    <div class="grp"><label>محدود به اینباند(های) خاص <small>(خالی = دسترسی به همه)</small></label>${inboundScopePickerHtml('e',a.allowed_inbounds||[])}</div>
+    <div class="grp"><label>محدود به اینباند(های) خاص</label>${inboundScopePickerHtml('e',a.allowed_inbounds||[])}
+      <label class="perm-item"><input type="checkbox" id="eAllowAll" ${a.scoped?'':'checked'}> اگر هیچ اینباندی انتخاب نشده، دسترسی به همه را بده</label></div>
     <div class="perm-grid">${perms.map(k=>`<label class="perm-item"><input type="checkbox" data-eperm="${k}" ${((a.permissions||[]).includes(k)?'checked':'')}>${labels[k]}</label>`).join('')}</div>
   `, `<button class="btn primary" style="flex:1" onclick="saveAdminEdit('${a.id}')"><i class="ti ti-device-floppy"></i>ذخیره تغییرات</button>`);
 }
@@ -4593,7 +4594,7 @@ async function saveAdminEdit(id){
   try{
     const permissions=[...document.querySelectorAll('[data-eperm]:checked')].map(x=>x.dataset.eperm);
     const allowed_inbounds=[...document.querySelectorAll('[data-escope]:checked')].map(x=>x.dataset.escope);
-    const body={username:$('eUser').value.trim(),permissions,allowed_inbounds}; if($('ePass').value) body.password=$('ePass').value;
+    const body={username:$('eUser').value.trim(),permissions,allowed_inbounds,scope_restricted:!$('eAllowAll').checked}; if($('ePass').value) body.password=$('ePass').value;
     await api(`/api/admins/${id}`,{method:'PATCH',body:JSON.stringify(body)}); toast('اطلاعات ادمین بروزرسانی شد ✓'); closeDrawer(); loadAdmins();
   }catch(e){toast(e.message,false)}
 }

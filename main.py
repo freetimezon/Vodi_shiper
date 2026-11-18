@@ -25,6 +25,8 @@ import aiofiles
 import httpx
 import uvicorn
 
+import persist_db
+
 from fastapi import (
     FastAPI,
     Request,
@@ -115,12 +117,8 @@ except Exception:
 # RAILWAY
 # ============================================================
 
-PORT = int(
-    os.environ.get(
-        "PORT",
-        "8000",
-    )
-)
+PORT = int(os.environ.get("PORT") or os.environ.get("SERVER_PORT") or "8000")
+HTTP_ONLY = os.environ.get("VW_HTTP_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
 
 DATA_DIR = Path(
     os.environ.get(
@@ -144,12 +142,8 @@ os.environ.setdefault("VW_FORCE_PORT", "443")
 
 # Shiprr دیسک دائمی ندارد: اگر DATABASE_URL ست باشد، فایل‌ها از Postgres برمی‌گردند
 # (باید قبل از لود شدن بقیه‌ی ماژول‌هایی که از DATA_DIR می‌خوانند اجرا شود)
-try:
-    import persist_db
-    persist_db.restore_sync(DATA_DIR)
-except Exception as _persist_exc:  # noqa: BLE001
-    persist_db = None
-    print(f"[persist] disabled: {_persist_exc}", flush=True)
+if persist_db.ENABLED and not persist_db.restore_sync(DATA_DIR):
+    raise RuntimeError("PostgreSQL restore failed. Check DATABASE_URL and redeploy; no data was saved.")
 
 DATA_FILE = DATA_DIR / "vodiwalker_state.json"
 SECRET_FILE = DATA_DIR / "vodiwalker_secret.key"
@@ -191,40 +185,21 @@ SESSIONS_LOCK = asyncio.Lock()
 # ============================================================
 
 def load_or_create_secret() -> str:
-    env_secret = os.environ.get("SECRET_KEY")
-
+    env_secret = os.environ.get("SECRET_KEY", "").strip()
     if env_secret:
         return env_secret
 
     try:
-        if SECRET_FILE.exists():
-            existing = (
-                SECRET_FILE
-                .read_text(
-                    encoding="utf-8"
-                )
-                .strip()
-            )
-
-            if existing:
-                return existing
-
+        existing = SECRET_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
         generated = secrets.token_urlsafe(48)
-
-        SECRET_FILE.write_text(
-            generated,
-            encoding="utf-8",
-        )
-
+        fd = os.open(SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(generated)
         return generated
-
-    except Exception as exc:
-        logger.warning(
-            "Could not persist SECRET_KEY: %s",
-            exc,
-        )
-
-        return secrets.token_urlsafe(48)
+    if not existing:
+        raise RuntimeError("The stored secret is empty. Restore it or set SECRET_KEY before starting.")
+    return existing
 
 
 SECRET_KEY = load_or_create_secret()
@@ -1136,15 +1111,13 @@ def hash_password(
     ).hexdigest()
 
 
-DEFAULT_ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin"
-DEFAULT_ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
+_ENV_ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip()
+_ENV_ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
+DEFAULT_ADMIN_USERNAME = _ENV_ADMIN_USERNAME or "admin"
 
 AUTH = {
     "username": DEFAULT_ADMIN_USERNAME,
-    "password_hash":
-        hash_password(
-            DEFAULT_ADMIN_PASSWORD
-        )
+    "password_hash": hash_password(_ENV_ADMIN_PASSWORD) if _ENV_ADMIN_PASSWORD else "",
 }
 
 # ============================================================
@@ -1217,12 +1190,12 @@ def has_permission(admin_id: str, key: str) -> bool:
 
 
 def admin_scope(admin_id: str):
-    """None = بدون محدودیت. وگرنه مجموعه‌ی UUID اینباندهایی که ادمین فقط به آن‌ها دسترسی دارد."""
+    """None = همهٔ اینباندها، مجموعهٔ خالی = هیچ اینباندی مجاز نیست."""
     if admin_id == "owner":
         return None
     a = ADMINS.get(admin_id) or {}
     lst = a.get("allowed_inbounds") or []
-    return set(lst) if lst else None
+    return set(lst) if lst or a.get("scope_restricted") else None
 
 
 def link_in_scope(scope, uid: str) -> bool:
@@ -1262,6 +1235,7 @@ def scope_remove_uid(uid: str):
         lst = a.get("allowed_inbounds")
         if lst and uid in lst:
             a["allowed_inbounds"] = [x for x in lst if x != uid]
+            a["scope_restricted"] = True
 
 
 def _apply_create_restrict(uid: str):
@@ -2102,9 +2076,6 @@ def get_link_info(
 # ============================================================
 
 async def load_state():
-
-    global AUTH
-
     try:
 
         DATA_DIR.mkdir(
@@ -2146,17 +2117,12 @@ async def load_state():
         )
 
         stored_username = data.get("username")
-        if isinstance(stored_username, str) and stored_username.strip():
+        if not _ENV_ADMIN_USERNAME and isinstance(stored_username, str) and stored_username.strip():
             AUTH["username"] = stored_username.strip()
 
-        stored_password = data.get(
-            "password_hash"
-        )
-
-        if stored_password:
-            AUTH[
-                "password_hash"
-            ] = stored_password
+        stored_password = data.get("password_hash")
+        if not _ENV_ADMIN_PASSWORD and isinstance(stored_password, str) and re.fullmatch(r"[0-9a-f]{64}", stored_password):
+            AUTH["password_hash"] = stored_password
 
         ADMINS.update(
             data.get("admins", {})
@@ -2254,11 +2220,7 @@ async def load_state():
         )
 
     except Exception as exc:
-
-        logger.exception(
-            "Could not load state: %s",
-            exc,
-        )
+        raise RuntimeError("Could not read existing VodiWalker state; startup stopped to preserve the data.") from exc
 
 
 async def save_state():
@@ -3101,7 +3063,7 @@ try:
     import tg_proxy as _tg_proxy
     import operators as _operators
     _operators.register(app, require_auth, DATA_DIR)
-    _tg_proxy.register(app, require_auth, DATA_DIR, logger)
+    _tg_proxy.register(app, require_auth, DATA_DIR, logger, http_only=HTTP_ONLY)
     from ui_assets import HERO_JPG as _HERO_JPG
     from fastapi.responses import Response as _Resp
 
@@ -3116,6 +3078,12 @@ except Exception as _exc:  # پنل بدون این ماژول‌ها هم با�
 async def startup():
 
     global http_client, USAGE_PERSIST_TASK, KEEPALIVE_TASK
+
+    await load_state()
+    if (_ENV_ADMIN_PASSWORD and len(_ENV_ADMIN_PASSWORD) < 8) or AUTH["password_hash"] in (
+        "", hash_password("admin"), hash_password(""),
+    ):
+        raise RuntimeError("Set ADMIN_PASSWORD to a strong password of at least 8 characters before starting.")
 
     limits = httpx.Limits(
         max_connections=500,
@@ -3133,8 +3101,6 @@ async def startup():
         follow_redirects=True,
     )
 
-    await load_state()
-
     if _ENV_PUBLIC_BASE:
         CONFIG["public_base_url"] = _ENV_PUBLIC_BASE
 
@@ -3149,8 +3115,7 @@ async def startup():
     except Exception as exc:
         logger.warning("Keep-alive not started: %s", exc)
     try:
-        if persist_db:
-            persist_db.start_background()
+        persist_db.start_background()
     except Exception as exc:
         logger.warning("DB persistence not started: %s", exc)
 
@@ -3179,11 +3144,14 @@ async def startup():
         DATA_DIR,
     )
 
-    try:
-        import tcp_relay
-        await tcp_relay.start_tcp_relay(app_logger=logger)
-    except Exception as exc:
-        logger.warning("VLESS-TCP relay startup skipped: %s", exc)
+    if HTTP_ONLY:
+        logger.info("HTTP-only mode: raw TCP relays disabled.")
+    else:
+        try:
+            import tcp_relay
+            await tcp_relay.start_tcp_relay(app_logger=logger)
+        except Exception as exc:
+            logger.warning("VLESS-TCP relay startup skipped: %s", exc)
 
 
 @app.on_event("shutdown")
@@ -3209,19 +3177,19 @@ async def shutdown():
         KEEPALIVE_TASK = None
 
     try:
-        if persist_db:
-            await asyncio.get_running_loop().run_in_executor(None, persist_db.stop_and_flush)
+        await asyncio.to_thread(persist_db.stop_and_flush)
     except Exception:
         pass
 
     if http_client:
         await http_client.aclose()
 
-    try:
-        import tcp_relay
-        await tcp_relay.stop_tcp_relay()
-    except Exception:
-        pass
+    if not HTTP_ONLY:
+        try:
+            import tcp_relay
+            await tcp_relay.stop_tcp_relay()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -3742,7 +3710,7 @@ async def api_me(
             "permissions": sorted(permissions_for_admin(admin_id)),
             "granted": sorted(k for k in ALL_PERMISSIONS if has_permission(admin_id, k)),
             "allowed_inbounds": list(_a.get("allowed_inbounds") or []),
-            "scoped": bool(_a.get("allowed_inbounds")),
+            "scoped": admin_scope(admin_id) is not None,
         },
     }
 
@@ -3841,6 +3809,9 @@ async def api_change_password(
     if not is_owner and not admin_record:
         raise HTTPException(status_code=401, detail="حساب کاربری یافت نشد")
 
+    if is_owner and _ENV_ADMIN_PASSWORD:
+        raise HTTPException(409, "رمز عبور مالک از متغیر ADMIN_PASSWORD تنظیم می‌شود؛ آن را در محیط استقرار تغییر دهید")
+
     try:
         body = await request.json()
     except Exception:
@@ -3934,6 +3905,9 @@ async def api_change_username(
     admin_record = None if is_owner else ADMINS.get(admin_id)
     if not is_owner and not admin_record:
         raise HTTPException(status_code=401, detail="حساب کاربری یافت نشد")
+
+    if is_owner and _ENV_ADMIN_USERNAME:
+        raise HTTPException(409, "نام کاربری مالک از متغیر ADMIN_USERNAME تنظیم می‌شود؛ آن را در محیط استقرار تغییر دهید")
 
     try:
         body = await request.json()
@@ -8409,20 +8383,21 @@ def _admin_public(admin_id: str, admin: dict) -> dict:
         "full_name": admin.get("full_name", ""),
         "telegram_id": admin.get("telegram_id", ""),
         "allowed_inbounds": list(admin.get("allowed_inbounds") or []),
+        "scoped": admin_scope(admin_id) is not None,
         "perm_v2": bool(admin.get("perm_v2")),
     }
 
 
-def _clean_allowed_inbounds(raw):
-    if not isinstance(raw, list):
-        return []
-    out = []
-    for u in raw:
-        u = str(u)
-        l = LINKS.get(u)
-        if l and not l.get("parent_inbound_id") and u not in out:
-            out.append(u)
-    return out
+def _admin_scope_fields(raw, restricted=False):
+    if raw is not None and not isinstance(raw, list):
+        raise HTTPException(400, "لیست اینباندهای مجاز نامعتبر است")
+    allowed = []
+    for uid in map(str, raw or []):
+        link = LINKS.get(uid)
+        if link and not link.get("parent_inbound_id") and uid not in allowed:
+            allowed.append(uid)
+    # Stale UUIDs must not turn a restricted admin into an unrestricted one.
+    return {"allowed_inbounds": allowed, "scope_restricted": bool(raw) or restricted is True}
 
 
 @app.get("/api/admins")
@@ -8475,7 +8450,7 @@ async def api_create_admin(request: Request, token=Depends(require_owner)):
         "role": "admin",
         "permissions": [p for p in (body.get("permissions") or ["dashboard", "inbounds", "subscriptions"]) if p in ALL_PERMISSIONS],
         "perm_v2": True,
-        "allowed_inbounds": _clean_allowed_inbounds(body.get("allowed_inbounds")),
+        **_admin_scope_fields(body.get("allowed_inbounds"), body.get("scope_restricted")),
         "active": True,
         "created_at": datetime.now().isoformat(),
         "last_login_at": None,
@@ -8527,8 +8502,11 @@ async def api_update_admin(admin_id: str, request: Request, token=Depends(requir
         admin["permissions"] = [p for p in raw_permissions if p in ALL_PERMISSIONS]
         admin["perm_v2"] = True
 
-    if "allowed_inbounds" in body:
-        admin["allowed_inbounds"] = _clean_allowed_inbounds(body.get("allowed_inbounds"))
+    if "allowed_inbounds" in body or "scope_restricted" in body:
+        admin.update(_admin_scope_fields(
+            body.get("allowed_inbounds", admin.get("allowed_inbounds")),
+            body.get("scope_restricted", admin_scope(admin_id) is not None),
+        ))
 
     if "active" in body:
         admin["active"] = bool(body["active"])
@@ -8703,7 +8681,7 @@ async def api_approve_admin_request(req_id: str, request: Request, token=Depends
         "full_name": req.get("full_name", ""),
         "telegram_id": req.get("telegram_id", ""),
         "perm_v2": True,
-        "allowed_inbounds": _clean_allowed_inbounds(body.get("allowed_inbounds")),
+        **_admin_scope_fields(body.get("allowed_inbounds"), body.get("scope_restricted")),
     }
 
     req["status"] = "approved"
