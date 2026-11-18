@@ -29,6 +29,8 @@ DB_URL = (
 
 ENABLED = bool(DB_URL)
 SYNC_INTERVAL = max(5, int(os.environ.get("PERSIST_INTERVAL", "15") or 15))
+CONNECT_TIMEOUT = 5
+RESTORE_ATTEMPTS = 3
 MAX_FILE_BYTES = 8 * 1024 * 1024
 SKIP_SUFFIXES = (".tmp", ".lock", ".swp", ".part")
 
@@ -40,41 +42,34 @@ _lock = threading.Lock()
 _data_dir = None
 
 
-def _ssl_contexts(query: dict):
-    mode = (query.get("sslmode") or [""])[0].lower()
-    verify = os.environ.get("PERSIST_SSL_VERIFY", "1") != "0"
+def _ssl_context(query: dict):
+    mode = (query.get("sslmode") or ["verify-full"])[0].lower()
     if mode == "disable":
-        return [None]
+        # pg8000 treats None as opportunistic, unverified TLS. False is explicit.
+        return False
+    if mode not in ("require", "verify-ca", "verify-full"):
+        raise ValueError("Unsupported PostgreSQL sslmode; use verify-full, require, verify-ca or disable")
     ctx = ssl.create_default_context()
-    if not verify:
+    if mode == "verify-ca":
         ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    # اول SSL، بعد (اگر سرور SSL نداشت) بدون SSL
-    return [ctx, None]
+    return ctx
 
 
 def _connect():
     import pg8000.native  # lazy: فقط وقتی لازم است
 
     u = urlparse(DB_URL)
-    query = parse_qs(u.query)
-    last_exc = None
-    for ctx in _ssl_contexts(query):
-        try:
-            kwargs = dict(
-                user=unquote(u.username or ""),
-                host=u.hostname,
-                port=u.port or 5432,
-                database=(u.path or "/postgres").lstrip("/") or "postgres",
-                password=unquote(u.password or ""),
-                timeout=15,
-            )
-            if ctx is not None:
-                kwargs["ssl_context"] = ctx
-            return pg8000.native.Connection(**kwargs)
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-    raise last_exc
+    if u.scheme not in ("postgres", "postgresql") or not u.hostname or not u.username:
+        raise ValueError("DATABASE_URL must be a PostgreSQL URL with a host and username")
+    return pg8000.native.Connection(
+        user=unquote(u.username),
+        host=u.hostname,
+        port=u.port or 5432,
+        database=unquote(u.path.lstrip("/")) or "postgres",
+        password=unquote(u.password or ""),
+        timeout=CONNECT_TIMEOUT,
+        ssl_context=_ssl_context(parse_qs(u.query)),
+    )
 
 
 def _ensure_table(conn):
@@ -115,6 +110,7 @@ def restore_sync(data_dir) -> bool:
     """قبل از import سایر ماژول‌ها صدا زده می‌شود. True یعنی دیتابیس در دسترس بود."""
     global _restore_ok, _data_dir
     _data_dir = Path(data_dir)
+    _restore_ok = False
     if not ENABLED:
         return False
 
@@ -125,7 +121,7 @@ def restore_sync(data_dir) -> bool:
         return False
 
     conn = None
-    for attempt in range(1, 6):
+    for attempt in range(1, RESTORE_ATTEMPTS + 1):
         try:
             conn = _connect()
             _ensure_table(conn)
@@ -157,7 +153,8 @@ def restore_sync(data_dir) -> bool:
             except Exception:  # noqa: BLE001
                 pass
             conn = None
-            time.sleep(min(2 * attempt, 8))
+            if attempt < RESTORE_ATTEMPTS:
+                time.sleep(2 * attempt)
     logger.error(
         "[persist] DATABASE NOT REACHABLE — data will NOT be saved to the database "
         "(to avoid overwriting good data). Fix DATABASE_URL and redeploy."

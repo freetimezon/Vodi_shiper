@@ -580,8 +580,15 @@ def attach_mux(app, config):
 # ============================================================
 # FastAPI integration
 # ============================================================
-def register(app, require_auth, data_dir, logger=None):
+def register(app, require_auth, data_dir, logger=None, *, http_only=False):
     from fastapi import Depends, HTTPException, Request
+
+    if http_only:
+        @app.get("/api/tgproxy", include_in_schema=False)
+        async def tg_disabled(_=Depends(require_auth)):
+            raise HTTPException(409, "پروکسی خام تلگرام در حالت فقط HTTP قابل اجرا نیست")
+
+        return None
 
     mgr = TgProxyManager(data_dir, logger)
     app.state.tg_proxy = mgr
